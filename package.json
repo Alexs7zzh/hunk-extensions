@@ -1,0 +1,25 @@
+{
+  "name": "hunk-extensions",
+  "version": "0.1.0",
+  "description": "A collection of extensions for the Hunk terminal diff viewer",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "packageManager": "bun@1.4.1",
+  "scripts": {
+    "check": "bun run check:manifests && bun run typecheck && bun run test",
+    "check:manifests": "bun run scripts/check-manifests.ts",
+    "test": "bun test plastic/src",
+    "test:integration": "bun test test/plastic.integration.test.ts",
+    "test:install": "bun run scripts/test-install.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@pierre/diffs": "1.3.5",
+    "@types/bun": "1.4.1",
+    "@types/node": "^24.3.0",
+    "diff": "^8.0.3",
+    "hunkdiff": "0.21.1",
+    "typescript": "^5.9.2"
+  }
+}

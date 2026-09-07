@@ -1,0 +1,14 @@
+{
+  "name": "hunk-plastic",
+  "version": "0.1.0",
+  "description": "Plastic SCM support for the Hunk terminal diff viewer",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "hunk": {
+    "extensions": [
+      "./index.ts"
+    ],
+    "apiVersion": 14
+  }
+}

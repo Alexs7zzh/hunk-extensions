@@ -1,0 +1,43 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.4.1
+      - run: bun install --frozen-lockfile
+      - run: bun run check
+      - name: Check release tag
+        run: bun run check:manifests
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+      - name: Test installation through Hunk
+        run: bun run test:install
+
+  release:
+    needs: validate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Create GitHub release
+        run: >-
+          gh release create "$GITHUB_REF_NAME"
+          --repo "$GITHUB_REPOSITORY"
+          --verify-tag
+          --generate-notes
+        env:
+          GH_TOKEN: ${{ github.token }}
