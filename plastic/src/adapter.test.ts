@@ -377,7 +377,41 @@ describe("Plastic adapter", () => {
     expect(change("CO+RP+MV")).toBe("moved");
     expect(change("CO+RP+CH")).toBe("change");
     expect(change("PR")).toBe("private");
-    expect(change("CO")).toBe("skip");
+    expect(change("CO")).toBe("change");
+  });
+
+  test("compares plain checkouts against the base even when Plastic calls replacements unchanged", async () => {
+    const root = await mkdtemp(join(tmpdir(), "hunk-plastic-checkout-"));
+    const statusXml = `<StatusOutput><RepSpec><Server>cloud</Server><Name>repo</Name></RepSpec><Changeset>7</Changeset><Changes>
+<Change><Type>CO</Type><TypeVerbose>Replaced / Checked-out (unchanged)</TypeVerbose><Path>replaced.txt</Path><RevisionType>enTextFile</RevisionType></Change>
+<Change><Type>CO</Type><TypeVerbose>Checked-out (unchanged)</TypeVerbose><Path>unchanged.txt</Path><RevisionType>enTextFile</RevisionType></Change>
+</Changes></StatusOutput>`;
+    const runner: PlasticCommandRunner = {
+      async run(args) {
+        if (args[0] === "status") return Buffer.from(statusXml);
+        if (args[0] === "ls")
+          return Buffer.from("txt\u001freplaced.txt\u001f5\u001e\ntxt\u001funchanged.txt\u001f6\u001e\n");
+        if (args[0] === "cat") return Buffer.from("base content\n");
+        throw new Error(`unexpected command ${args.join(" ")}`);
+      },
+      runSync: unreachableRunner.runSync,
+    };
+    try {
+      await mkdir(join(root, ".plastic"));
+      await writeFile(join(root, "replaced.txt"), "replacement content\n");
+      await writeFile(join(root, "unchanged.txt"), "base content\n");
+      const result = await createPlasticVcsAdapter({ runner }).operations[
+        "working-tree-diff"
+      ]!.load({ kind: "vcs", staged: false, options: {} }, { cwd: root });
+      expect(result.extraFiles?.map((file) => file.path)).toEqual(["replaced.txt"]);
+      const file = result.extraFiles?.[0];
+      expect(file?.kind).toBe("patch");
+      if (file?.kind !== "patch") throw new Error("expected a patch");
+      expect(file.patchText).toContain("-base content");
+      expect(file.patchText).toContain("+replacement content");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   test("expands private directories without including ignored descendants", async () => {

@@ -233,7 +233,10 @@ function classifyPlasticWorkspaceCode(
   if (codes.has("LM") || codes.has("MV")) return "moved";
   if (codes.has("AD") || codes.has("CP")) return "new";
   if (codes.has("CH") || codes.has("HD") || codes.has("RP")) return "change";
-  if (codes.has("CO") || codes.has("IG")) return "skip";
+  // Replaced checkouts can report plain CO even when they differ from the
+  // workspace changeset. Let the content comparison discard identical files.
+  if (codes.has("CO")) return "change";
+  if (codes.has("IG")) return "skip";
   throw new HunkExtensionUserError(
     `Plastic reported unsupported workspace status ${JSON.stringify(change.code)} for ${JSON.stringify(change.path)}.`,
     {
