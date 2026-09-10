@@ -40,7 +40,9 @@ import {
 } from "./process";
 
 type PlasticInput = ExtensionVcsDiffInput | ExtensionVcsShowInput;
-type PlasticReviewFile = PlasticBuiltFile | ExtensionVcsSkippedFile;
+type PlasticReviewFile = (PlasticBuiltFile | ExtensionVcsSkippedFile) & {
+  isUntracked?: boolean;
+};
 
 /** Matches Hunk 0.21.1's built-in per-file render ceiling. */
 export const PLASTIC_DIFF_FILE_MAX_BYTES = 1_000_000;
@@ -908,11 +910,10 @@ async function mapFiles<T>(
         retainedSourceBytes + file.sourceBytes >
           PLASTIC_REVIEW_MAX_SOURCE_BYTES
       ) {
-        results[index] = skippedFile(
-          file.path,
-          file.previousPath,
-          file.changeType,
-        );
+        results[index] = {
+          ...skippedFile(file.path, file.previousPath, file.changeType),
+          ...(file.isUntracked ? { isUntracked: true } : {}),
+        };
         continue;
       }
       if (file !== null && isBuiltFile(file)) {
@@ -927,13 +928,27 @@ async function mapFiles<T>(
 function toExtraFiles(
   files: readonly PlasticReviewFile[],
 ): ExtensionVcsExtraFile[] {
-  return files.map((file) =>
+  // Compare path components with directories first, so each folder stays together
+  // even when Plastic groups its inventory by change status.
+  const ordered = [...files].sort((left, right) => {
+    const a = left.path.split("/");
+    const b = right.path.split("/");
+    for (let index = 0; index < Math.min(a.length, b.length); index++) {
+      const aDirectory = index < a.length - 1;
+      const bDirectory = index < b.length - 1;
+      if (aDirectory !== bDirectory) return aDirectory ? -1 : 1;
+      if (a[index] !== b[index]) return a[index]! < b[index]! ? -1 : 1;
+    }
+    return a.length - b.length;
+  });
+  return ordered.map((file) =>
     isBuiltFile(file)
       ? {
           kind: "patch",
           path: file.path,
           ...(file.previousPath ? { previousPath: file.previousPath } : {}),
           patchText: file.patchText,
+          ...(file.isUntracked ? { isUntracked: true } : {}),
         }
       : file,
   );
@@ -1114,31 +1129,27 @@ export function createPlasticVcsAdapter({
                 repoRoot,
               ),
             );
-            const untrackedPaths = input.options.excludeUntracked
-              ? []
-              : selected
-                  .filter(
-                    (change) =>
-                      classifyPlasticWorkspaceChange(change) === "private",
-                  )
-                  .map((change) => change.path);
-            const tracked = selected.flatMap((change) => {
+            const reviewChanges = selected.flatMap((change) => {
               const kind = classifyPlasticWorkspaceChange(change);
-              return kind === "private" || kind === "skip"
+              return kind === "skip" ||
+                (kind === "private" && input.options.excludeUntracked)
                 ? []
                 : [{ change, kind }];
             });
             const built = (
-              await mapFiles(tracked, ({ change, kind }) =>
-                buildWorkspaceFile(
+              await mapFiles(reviewChanges, async ({ change, kind }) => {
+                const file = await buildWorkspaceFile(
                   runner,
                   repoRoot,
                   status,
                   change,
-                  kind,
+                  kind === "private" ? "new" : kind,
                   signal,
-                ),
-              )
+                );
+                return file && kind === "private"
+                  ? { ...file, isUntracked: true }
+                  : file;
+              })
             ).filter((file): file is PlasticReviewFile => file !== null);
             return {
               repoRoot,
@@ -1146,7 +1157,6 @@ export function createPlasticVcsAdapter({
               title: `${basename(repoRoot)} working copy`,
               patchText: "",
               extraFiles: toExtraFiles(built),
-              untrackedPaths,
               ...sourceCapability(built),
             };
           } catch (error) {

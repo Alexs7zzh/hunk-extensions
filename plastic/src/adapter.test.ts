@@ -88,10 +88,13 @@ describe("Plastic adapter", () => {
 
       expect(result.extraFiles?.map((file) => file.path)).toEqual([
         "src/main;part.ts",
+        "notes.txt",
       ]);
-      expect(
-        "untrackedPaths" in result ? result.untrackedPaths : undefined,
-      ).toEqual(["notes.txt"]);
+      expect(result.extraFiles?.[1]).toMatchObject({
+        path: "notes.txt",
+        kind: "patch",
+        isUntracked: true,
+      });
       expect(
         (result.extraFiles?.[0]?.kind === "patch" &&
           result.extraFiles[0].patchText) ||
@@ -106,6 +109,83 @@ describe("Plastic adapter", () => {
           ["add", "checkout", "checkin", "update"].includes(args[0]!),
         ),
       ).toBe(false);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("groups mixed workspace changes by folder, including private files", async () => {
+    const root = await mkdtemp(join(tmpdir(), "hunk-plastic-order-"));
+    const changes = [
+      ["CH", "src/z.txt"],
+      ["CH", "other/changed.txt"],
+      ["AD", "src/a.txt"],
+      ["AD", "src/nested/child.txt"],
+      ["PR", "src/private.txt"],
+      ["PR", "src/large.txt"],
+      ["AD", "src-sibling.txt"],
+    ];
+    const statusXml = `<StatusOutput><RepSpec><Server>cloud</Server><Name>repo</Name></RepSpec><Changeset>7</Changeset><Changes>${changes
+      .map(([code, path]) =>
+        `<Change><Type>${code}</Type><Path>${path}</Path><RevisionType>enTextFile</RevisionType></Change>`,
+      )
+      .join("")}</Changes></StatusOutput>`;
+    const runner: PlasticCommandRunner = {
+      async run(args) {
+        if (args[0] === "status") return Buffer.from(statusXml);
+        if (args[0] === "ls")
+          return Buffer.from(
+            "txt\u001fsrc/z.txt\u001f5\u001e" +
+              "txt\u001fother/changed.txt\u001f6\u001e",
+          );
+        if (args[0] === "cat") return Buffer.from("before\n");
+        throw new Error(`unexpected command ${args.join(" ")}`);
+      },
+      runSync: unreachableRunner.runSync,
+    };
+    try {
+      await mkdir(join(root, ".plastic"));
+      await mkdir(join(root, "src/nested"), { recursive: true });
+      await mkdir(join(root, "other"));
+      for (const [, path] of changes) {
+        await writeFile(
+          join(root, path!),
+          path === "src/large.txt"
+            ? Buffer.alloc(PLASTIC_DIFF_FILE_MAX_BYTES + 1, "x")
+            : "after\n",
+        );
+      }
+      const adapter = createPlasticVcsAdapter({ runner });
+      for (const excludeUntracked of [false, true]) {
+        const result = await adapter.operations["working-tree-diff"].load(
+          { kind: "vcs", staged: false, options: { excludeUntracked } },
+          { cwd: root },
+        );
+        expect(result.extraFiles?.map((file) => file.path)).toEqual([
+          "other/changed.txt",
+          "src/nested/child.txt",
+          "src/a.txt",
+          ...(excludeUntracked ? [] : ["src/large.txt", "src/private.txt"]),
+          "src/z.txt",
+          "src-sibling.txt",
+        ]);
+        if (!excludeUntracked) {
+          expect(
+            result.extraFiles?.find((file) => file.path === "src/large.txt"),
+          ).toMatchObject({ kind: "skipped", isUntracked: true });
+          expect(
+            result.extraFiles?.find((file) => file.path === "src/private.txt"),
+          ).toMatchObject({ kind: "patch", isUntracked: true });
+          expect(
+            await result.readFileSource?.({
+              path: "src/private.txt",
+              side: "new",
+              changeType: "new",
+              isUntracked: true,
+            }),
+          ).toBe("after\n");
+        }
+      }
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -271,7 +351,9 @@ describe("Plastic adapter", () => {
       expect(
         result.extraFiles?.filter((file) => file.kind === "skipped"),
       ).toHaveLength(1);
-      expect(result.extraFiles?.at(-1)).toMatchObject({
+      expect(
+        result.extraFiles?.find((file) => file.path === `${fileCount - 1}.bin`),
+      ).toMatchObject({
         kind: "skipped",
         path: `${fileCount - 1}.bin`,
       });
@@ -329,9 +411,9 @@ describe("Plastic adapter", () => {
       const result = await createPlasticVcsAdapter({ runner }).operations[
         "working-tree-diff"
       ]!.load({ kind: "vcs", staged: false, options: {} }, { cwd: root });
-      expect(
-        "untrackedPaths" in result ? result.untrackedPaths : undefined,
-      ).toEqual(["private-dir/keep.txt"]);
+      expect(result.extraFiles).toMatchObject([
+        { path: "private-dir/keep.txt", kind: "patch", isUntracked: true },
+      ]);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -479,6 +561,8 @@ describe("Plastic adapter", () => {
       async run(args) {
         if (args[0] === "status") return Buffer.from(statusXml);
         if (args[0] === "diff") return Buffer.from(diffOutput);
+        if (args[0] === "log") return Buffer.from("2");
+        if (args[0] === "find") return Buffer.from("1");
         if (args[0] === "ls")
           return Buffer.from(args.includes("--tree=cs:1") ? oldTree : newTree);
         if (args[0] === "cat") {
@@ -516,13 +600,18 @@ describe("Plastic adapter", () => {
         },
         { cwd: root },
       );
+      const shown = await adapter.operations["revision-show"].load(
+        { kind: "show", ref: "cs:2", options: {} },
+        { cwd: root },
+      );
+      expect(shown.extraFiles).toEqual(result.extraFiles);
       expect(result.extraFiles?.map((file) => file.path)).toEqual([
-        "new.txt",
+        "gone/a.txt",
         "new-dir/a.txt",
         "CLAUDE.md",
-        "gone/a.txt",
+        "new.txt",
       ]);
-      expect(result.extraFiles?.[0]).toMatchObject({
+      expect(result.extraFiles?.[3]).toMatchObject({
         path: "new.txt",
         previousPath: "old.txt",
       });
@@ -549,8 +638,8 @@ describe("Plastic adapter", () => {
         }),
       ).toBe("old instructions\n");
       expect(
-        result.extraFiles?.[3]?.kind === "patch"
-          ? result.extraFiles[3].patchText
+        result.extraFiles?.[0]?.kind === "patch"
+          ? result.extraFiles[0].patchText
           : "",
       ).toContain("-deleted");
     } finally {

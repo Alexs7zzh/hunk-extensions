@@ -21,6 +21,8 @@ The adapter only runs read commands: `cm status`, `cm diff`, `cm ls`, `cm filein
 
 The extension has no runtime npm dependencies. Bun is only needed for development.
 
+Files are grouped by folder and sorted alphabetically, with subfolders first. Private files appear alongside tracked changes and keep their untracked labels.
+
 Files larger than 1 MB or 20,000 lines stay visible in the file list but are not rendered. The adapter also caps retained source data at 32 MB per review. These limits keep large asset changes from exhausting Hunk's memory and match Hunk's built-in per-file limits.
 
 ## Usage
