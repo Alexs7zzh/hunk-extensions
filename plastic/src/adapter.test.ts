@@ -3,17 +3,57 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import type { ExtensionVcsDiffInput } from "hunkdiff/extension";
+import { parsePatchFiles } from "@pierre/diffs";
 import {
   PLASTIC_DIFF_FILE_MAX_BYTES,
   PLASTIC_DIFF_FILE_MAX_LINES,
   PLASTIC_REVIEW_MAX_SOURCE_BYTES,
   classifyPlasticWorkspaceChange,
-  createPlasticVcsAdapter,
+  createPlasticVcsAdapter as createAdapter,
+  type PlasticVcsAdapterOptions,
 } from "./adapter";
 import {
   PlasticCommandOutputTooLarge,
+  PlasticDownloadTooLarge,
   type PlasticCommandRunner,
 } from "./process";
+
+// Existing command fixtures describe revision bytes. Adapt those fixtures to
+// cm's file-output protocol; read-session tests exercise the actual batches.
+function createPlasticVcsAdapter(options: PlasticVcsAdapterOptions) {
+  const original = options.runner!;
+  const runner: PlasticCommandRunner = {
+    ...original,
+    async run(args, cwd, signal, maxBytes, downloads) {
+      if (args[0] !== "cat") return original.run(args, cwd, signal, maxBytes);
+      for (const pair of args.slice(1).filter((arg) => !arg.startsWith("--"))) {
+        const separator = pair.lastIndexOf(";");
+        const path = pair.slice(separator + 1);
+        try {
+          const content = await original.run(
+            [
+              "cat",
+              pair.slice(0, separator),
+              ...args.filter((arg) => arg.startsWith("--")),
+            ],
+            cwd,
+            signal,
+            downloads!.maxBytes,
+          );
+          if (content.length > downloads!.maxBytes)
+            throw new PlasticCommandOutputTooLarge(args, downloads!.maxBytes);
+          await writeFile(path, content);
+        } catch (error) {
+          if (error instanceof PlasticCommandOutputTooLarge)
+            throw new PlasticDownloadTooLarge([path], error.maxBytes);
+          throw error;
+        }
+      }
+      return Buffer.alloc(0);
+    },
+  };
+  return createAdapter({ ...options, runner, cacheDirectory: false });
+}
 
 const unreachableRunner: PlasticCommandRunner = {
   async run() {
@@ -52,6 +92,60 @@ describe("Plastic adapter", () => {
         cwd: "/not-a-workspace",
       }),
     ).rejects.toThrow("Plastic SCM has no staging area");
+  });
+
+  test("explicit revision inventories overlap workspace headers", async () => {
+    const root = await mkdtemp(join(tmpdir(), "hunk-parallel-header-"));
+    const status = Buffer.from(
+      `<StatusOutput><WorkspaceStatus><Status><RepSpec><Server>cloud</Server><Name>repo</Name></RepSpec><Changeset>2</Changeset></Status></WorkspaceStatus><Changes/></StatusOutput>`,
+    );
+    try {
+      await mkdir(join(root, ".plastic"));
+      for (const mode of ["range", "show"] as const) {
+        let release!: () => void;
+        const inventoryStarted = new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        const adapter = createPlasticVcsAdapter({
+          runner: {
+            runSync: unreachableRunner.runSync,
+            async run(args) {
+              if (args[0] === "status") {
+                await inventoryStarted;
+                return status;
+              }
+              if (args[0] === "diff") {
+                release();
+                return Buffer.alloc(0);
+              }
+              throw new Error(`unexpected command ${args[0]}`);
+            },
+          },
+        });
+        const result =
+          mode === "range"
+            ? await adapter.operations["working-tree-diff"]!.load(
+                {
+                  kind: "vcs",
+                  staged: false,
+                  rangeEndpoints: { from: "cs:1", to: "cs:2" },
+                  options: {},
+                },
+                { cwd: root },
+              )
+            : await adapter.operations["revision-show"].load(
+                {
+                  kind: "show",
+                  ref: "cs:2",
+                  options: {},
+                },
+                { cwd: root },
+              );
+        expect(result.extraFiles).toEqual([]);
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   test("loads tracked and private workspace changes from read-only Plastic commands", async () => {
@@ -126,8 +220,9 @@ describe("Plastic adapter", () => {
       ["AD", "src-sibling.txt"],
     ];
     const statusXml = `<StatusOutput><RepSpec><Server>cloud</Server><Name>repo</Name></RepSpec><Changeset>7</Changeset><Changes>${changes
-      .map(([code, path]) =>
-        `<Change><Type>${code}</Type><Path>${path}</Path><RevisionType>enTextFile</RevisionType></Change>`,
+      .map(
+        ([code, path]) =>
+          `<Change><Type>${code}</Type><Path>${path}</Path><RevisionType>enTextFile</RevisionType></Change>`,
       )
       .join("")}</Changes></StatusOutput>`;
     const runner: PlasticCommandRunner = {
@@ -191,6 +286,191 @@ describe("Plastic adapter", () => {
     }
   });
 
+  test("passes additions, deletions, changes, renames, binary markers, and untracked labels to Hunk", async () => {
+    const root = await mkdtemp(join(tmpdir(), "hunk-plastic-metadata-"));
+    const records = [
+      ["AD", "added.txt", "", "enTextFile"],
+      ["AD", "empty.txt", "", "enTextFile"],
+      ["CH", "changed.txt", "", "enTextFile"],
+      ["LD", "deleted.txt", "", "enTextFile"],
+      ["LM", "renamed.txt", "old.txt", "enTextFile"],
+      ["PR", "private.txt", "", "enTextFile"],
+      ["AD", "asset.bin", "", "enBinaryFile"],
+    ];
+    const statusXml = `<StatusOutput><RepSpec><Server>cloud</Server><Name>repo</Name></RepSpec><Changeset>7</Changeset><Changes>${records
+      .map(
+        ([code, path, old, type]) =>
+          `<Change><Type>${code}</Type><Path>${path}</Path><OldPath>${old}</OldPath><RevisionType>${type}</RevisionType></Change>`,
+      )
+      .join("")}</Changes></StatusOutput>`;
+    const runner: PlasticCommandRunner = {
+      runSync: unreachableRunner.runSync,
+      async run(args) {
+        if (args[0] === "status") return Buffer.from(statusXml);
+        if (args[0] === "ls")
+          return Buffer.from(
+            "txt\u001fchanged.txt\u001f1\u001e\ntxt\u001fdeleted.txt\u001f2\u001e\ntxt\u001fold.txt\u001f3\u001e",
+          );
+        if (args[0] === "cat") return Buffer.from("before\n");
+        throw new Error(`unexpected command ${args.join(" ")}`);
+      },
+    };
+    try {
+      await mkdir(join(root, ".plastic"));
+      for (const path of ["added.txt", "changed.txt", "private.txt"])
+        await writeFile(join(root, path), "after\n");
+      await writeFile(join(root, "empty.txt"), "");
+      await writeFile(join(root, "renamed.txt"), "before\n");
+      await writeFile(join(root, "asset.bin"), Buffer.from([0, 255]));
+      const result = await createPlasticVcsAdapter({ runner }).operations[
+        "working-tree-diff"
+      ].load({ kind: "vcs", staged: false, options: {} }, { cwd: root });
+      const metadata = result.extraFiles!.map((file) => {
+        if (file.kind !== "patch") throw new Error("expected a patch");
+        const parsed = parsePatchFiles(file.patchText, "patch", true).flatMap(
+          (patch) => patch.files,
+        );
+        expect(parsed).toHaveLength(1);
+        return [file.path, parsed[0]!.type, file.isUntracked === true];
+      });
+      expect(metadata).toEqual([
+        ["added.txt", "new", false],
+        ["asset.bin", "new", false],
+        ["changed.txt", "change", false],
+        ["deleted.txt", "deleted", false],
+        ["empty.txt", "new", false],
+        ["private.txt", "new", true],
+        ["renamed.txt", "rename-pure", false],
+      ]);
+      expect(
+        result.extraFiles!.find((file) => file.path === "renamed.txt"),
+      ).toMatchObject({ previousPath: "old.txt" });
+      expect(
+        result.extraFiles!.find((file) => file.path === "asset.bin"),
+      ).toMatchObject({
+        patchText: expect.stringContaining(
+          "Binary files /dev/null and b/asset.bin differ",
+        ),
+      });
+      expect(
+        await result.readFileSource!({
+          path: "added.txt",
+          changeType: "new",
+          side: "old",
+          isUntracked: false,
+        }),
+      ).toBeNull();
+      expect(
+        await result.readFileSource!({
+          path: "deleted.txt",
+          changeType: "deleted",
+          side: "new",
+          isUntracked: false,
+        }),
+      ).toBeNull();
+      expect(
+        await result.readFileSource!({
+          path: "renamed.txt",
+          previousPath: "old.txt",
+          changeType: "rename-pure",
+          side: "old",
+          isUntracked: false,
+        }),
+      ).toBe("before\n");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("filters paths before inventory lookups and avoids expanding excluded private directories", async () => {
+    const root = await mkdtemp(join(tmpdir(), "hunk-plastic-filter-"));
+    const calls: string[][] = [];
+    const statusXml = `<StatusOutput><RepSpec><Server>cloud</Server><Name>repo</Name></RepSpec><Changeset>7</Changeset><Changes>
+<Change><Type>CH</Type><Path>keep.txt</Path><RevisionType>enTextFile</RevisionType></Change>
+<Change><Type>CH</Type><Path>outside.txt</Path><RevisionType>enTextFile</RevisionType></Change>
+<Change><Type>PR</Type><Path>unread-private-dir</Path><RevisionType>enDirectory</RevisionType></Change></Changes></StatusOutput>`;
+    const runner: PlasticCommandRunner = {
+      runSync: unreachableRunner.runSync,
+      async run(args) {
+        calls.push([...args]);
+        if (args[0] === "status") return Buffer.from(statusXml);
+        if (args[0] === "ls") {
+          expect(args).toContain("/keep.txt");
+          expect(args).not.toContain("/outside.txt");
+          return Buffer.from("txt\u001fkeep.txt\u001f1\u001e");
+        }
+        if (args[0] === "cat") return Buffer.from("before\n");
+        throw new Error(`unexpected command ${args.join(" ")}`);
+      },
+    };
+    try {
+      await mkdir(join(root, ".plastic"));
+      await writeFile(join(root, "keep.txt"), "after\n");
+      const result = await createPlasticVcsAdapter({ runner }).operations[
+        "working-tree-diff"
+      ].load(
+        {
+          kind: "vcs",
+          staged: false,
+          pathspecs: ["keep.txt"],
+          options: { excludeUntracked: true },
+        },
+        { cwd: root },
+      );
+      expect(result.extraFiles?.map((file) => file.path)).toEqual(["keep.txt"]);
+      expect(calls.map((args) => args[0])).toEqual(["status", "ls", "cat"]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("batches unreported directory descendants and reuses files already returned by status", async () => {
+    const root = await mkdtemp(join(tmpdir(), "hunk-plastic-private-batch-"));
+    const statusXml = `<StatusOutput><RepSpec><Server>cloud</Server><Name>repo</Name></RepSpec><Changeset>7</Changeset><Changes>
+<Change><Type>PR</Type><Path>one</Path><RevisionType>enDirectory</RevisionType></Change>
+<Change><Type>PR</Type><Path>two</Path><RevisionType>enDirectory</RevisionType></Change>
+<Change><Type>PR</Type><Path>one/reported.txt</Path><RevisionType>enTextFile</RevisionType></Change></Changes></StatusOutput>`;
+    let infoCalls = 0;
+    const runner: PlasticCommandRunner = {
+      runSync: unreachableRunner.runSync,
+      async run(args) {
+        if (args[0] === "status") return Buffer.from(statusXml);
+        if (args[0] === "fileinfo") {
+          infoCalls++;
+          expect(args).toContain(join(root, "one/missing.txt"));
+          expect(args).toContain(join(root, "two/missing.txt"));
+          expect(args).not.toContain(join(root, "one/reported.txt"));
+          return Buffer.from(
+            "one/missing.txt\u001fprivate\u001ftxt\u001e\ntwo/missing.txt\u001fprivate\u001ftxt\u001e",
+          );
+        }
+        throw new Error(`unexpected command ${args.join(" ")}`);
+      },
+    };
+    try {
+      await mkdir(join(root, ".plastic"));
+      await mkdir(join(root, "one"));
+      await mkdir(join(root, "two"));
+      for (const path of [
+        "one/reported.txt",
+        "one/missing.txt",
+        "two/missing.txt",
+      ])
+        await writeFile(join(root, path), "private\n");
+      const result = await createPlasticVcsAdapter({ runner }).operations[
+        "working-tree-diff"
+      ].load({ kind: "vcs", staged: false, options: {} }, { cwd: root });
+      expect(result.extraFiles?.map((file) => file.path)).toEqual([
+        "one/missing.txt",
+        "one/reported.txt",
+        "two/missing.txt",
+      ]);
+      expect(infoCalls).toBe(1);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("lists a tracked file when Plastic stops an oversized source read", async () => {
     const root = await mkdtemp(join(tmpdir(), "hunk-plastic-remote-limit-"));
     const statusXml = `<?xml version="1.0"?><StatusOutput><WorkspaceStatus><Status><RepSpec><Server>cloud</Server><Name>repo</Name></RepSpec><Changeset>7</Changeset></Status></WorkspaceStatus><Changes><Change><Type>CH</Type><Path>large.bin</Path><OldPath/><RevisionType>enBinaryFile</RevisionType></Change></Changes></StatusOutput>`;
@@ -212,6 +492,7 @@ describe("Plastic adapter", () => {
 
     try {
       await mkdir(join(root, ".plastic"));
+      await writeFile(join(root, "large.bin"), "small working copy\n");
       const result = await createPlasticVcsAdapter({ runner }).operations[
         "working-tree-diff"
       ]!.load({ kind: "vcs", staged: false, options: {} }, { cwd: root });
@@ -221,6 +502,7 @@ describe("Plastic adapter", () => {
           path: "large.bin",
           reason: "too-large",
           changeType: "change",
+          statsTruncated: true,
         },
       ]);
       expect(
@@ -390,7 +672,9 @@ describe("Plastic adapter", () => {
       async run(args) {
         if (args[0] === "status") return Buffer.from(statusXml);
         if (args[0] === "ls")
-          return Buffer.from("txt\u001freplaced.txt\u001f5\u001e\ntxt\u001funchanged.txt\u001f6\u001e\n");
+          return Buffer.from(
+            "txt\u001freplaced.txt\u001f5\u001e\ntxt\u001funchanged.txt\u001f6\u001e\n",
+          );
         if (args[0] === "cat") return Buffer.from("base content\n");
         throw new Error(`unexpected command ${args.join(" ")}`);
       },
@@ -403,7 +687,9 @@ describe("Plastic adapter", () => {
       const result = await createPlasticVcsAdapter({ runner }).operations[
         "working-tree-diff"
       ]!.load({ kind: "vcs", staged: false, options: {} }, { cwd: root });
-      expect(result.extraFiles?.map((file) => file.path)).toEqual(["replaced.txt"]);
+      expect(result.extraFiles?.map((file) => file.path)).toEqual([
+        "replaced.txt",
+      ]);
       const file = result.extraFiles?.[0];
       expect(file?.kind).toBe("patch");
       if (file?.kind !== "patch") throw new Error("expected a patch");
@@ -513,6 +799,18 @@ describe("Plastic adapter", () => {
         path: "new-dir/b.txt",
         previousPath: "old-dir/a.txt",
       });
+      const filtered = await createPlasticVcsAdapter({ runner }).operations[
+        "working-tree-diff"
+      ].load(
+        {
+          kind: "vcs",
+          staged: false,
+          pathspecs: ["new-dir/a.txt"],
+          options: {},
+        },
+        { cwd: root },
+      );
+      expect(filtered.extraFiles).toEqual([]);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -546,6 +844,55 @@ describe("Plastic adapter", () => {
       await writeFile(child, "a different size\n");
       const after = operation.watchSignature!(input, { cwd: root });
       expect(after).not.toBe(before);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("uses cancellable async watch on API 25 while preserving the older synchronous contract", async () => {
+    const root = await mkdtemp(join(tmpdir(), "hunk-plastic-async-watch-"));
+    const statusXml = `<StatusOutput><RepSpec><Server>cloud</Server><Name>repo</Name></RepSpec><Changeset>7</Changeset><Changes><Change><Type>PR</Type><Path>private-dir</Path><RevisionType>enDirectory</RevisionType></Change></Changes></StatusOutput>`;
+    let asyncCalls = 0;
+    let syncCalls = 0;
+    const runner: PlasticCommandRunner = {
+      async run(_args, _cwd, signal) {
+        asyncCalls++;
+        signal?.throwIfAborted();
+        return Buffer.from(statusXml);
+      },
+      runSync() {
+        syncCalls++;
+        return Buffer.from(statusXml);
+      },
+    };
+    const input: ExtensionVcsDiffInput = {
+      kind: "vcs",
+      staged: false,
+      options: {},
+    };
+    try {
+      await mkdir(join(root, ".plastic"));
+      await mkdir(join(root, "private-dir"));
+      await writeFile(join(root, "private-dir/child.txt"), "before\n");
+      const oldHook = createPlasticVcsAdapter({ runner, apiVersion: 14 })
+        .operations["working-tree-diff"].watchSignature;
+      const newHook = createPlasticVcsAdapter({ runner, apiVersion: 25 })
+        .operations["working-tree-diff"].watchSignature;
+      const old = oldHook(input, { cwd: root });
+      const pending = newHook(input, { cwd: root });
+      expect(typeof old).toBe("string");
+      expect(pending).toBeInstanceOf(Promise);
+      expect(await pending).toBe(old);
+      expect(syncCalls).toBe(1);
+      expect(asyncCalls).toBe(1);
+      await writeFile(join(root, "private-dir/child.txt"), "a new length\n");
+      expect(await newHook(input, { cwd: root })).not.toBe(old);
+      const controller = new AbortController();
+      controller.abort(new Error("cancelled watch"));
+      const cancelledContext = { cwd: root, signal: controller.signal };
+      await expect(
+        Promise.resolve(newHook(input, cancelledContext)),
+      ).rejects.toThrow("cancelled watch");
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -612,6 +959,11 @@ describe("Plastic adapter", () => {
           };
           if (revision === "70" && !args.includes("--symlink"))
             throw new Error("symlink revision requires --symlink");
+          if (revision === "70")
+            return Buffer.concat([
+              Buffer.from([0xff, 0xfe]),
+              Buffer.from("AGENTS.md", "utf16le"),
+            ]);
           if (revision && revision in contents)
             return Buffer.from(contents[revision]!);
         }
@@ -671,6 +1023,14 @@ describe("Plastic adapter", () => {
           side: "old",
         }),
       ).toBe("old instructions\n");
+      expect(
+        await result.readFileSource?.({
+          path: "CLAUDE.md",
+          changeType: "change",
+          isUntracked: false,
+          side: "new",
+        }),
+      ).toBe("AGENTS.md");
       expect(
         result.extraFiles?.[0]?.kind === "patch"
           ? result.extraFiles[0].patchText

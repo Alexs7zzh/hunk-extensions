@@ -101,6 +101,18 @@ describe("Plastic file patches", () => {
     expect(parseOne(deleted!.patchText).type).toBe("deleted");
   });
 
+  test("counts complete changes for budget-skipped files without counting patch headers", () => {
+    const file = buildPlasticFilePatch({
+      path: "stats.txt",
+      oldContent: Buffer.from("--- old\ncontext\n"),
+      newContent: Buffer.from("+++ new\nextra\ncontext\n"),
+    })!;
+    expect(file.stats).toEqual({ additions: 2, deletions: 1 });
+    expect(applyPatch("--- old\ncontext\n", file.patchText)).toBe(
+      "+++ new\nextra\ncontext\n",
+    );
+  });
+
   test("preserves a pure rename even when file contents do not change", () => {
     const file = buildPlasticFilePatch({
       path: "src/new name.ts",

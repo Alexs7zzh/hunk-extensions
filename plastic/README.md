@@ -25,6 +25,24 @@ Files are grouped by folder and sorted alphabetically, with subfolders first. Pr
 
 Files larger than 1 MB or 20,000 lines stay visible in the file list but are not rendered. The adapter also caps retained source data at 32 MB per review. These limits keep large asset changes from exhausting Hunk's memory and match Hunk's built-in per-file limits.
 
+Added, modified, deleted, and renamed files keep their change types in Hunk. Private files carry the untracked label as well as the added-file patch. Binary markers, previous paths, symlink modes, and exact source contents are preserved. Skipped files retain their change type and any known line counts; unknown counts are marked as incomplete.
+
+## Loading and caching
+
+The adapter batches revision downloads and filters paths before querying base inventories. Private-directory expansion reuses entries already returned by status and batches queries for any remaining descendants. Downloads preserve binary bytes and text byte-order marks instead of using Plastic's text-converting stdout output.
+
+Immutable revision contents and numbered-changeset inventories are cached on disk. Working-copy contents and status are always read again. Cache entries include checksums, publish atomically, and are evicted by recent use to stay within 256 MB and 4,096 entries. An unavailable or damaged cache falls back to Plastic.
+
+The cache lives under `hunk/plastic/v1` in `$XDG_CACHE_HOME` when set, otherwise:
+
+- macOS: `~/Library/Caches`
+- Linux: `~/.cache`
+- Windows: `%LOCALAPPDATA%`
+
+Delete that extension cache directory to clear it. The next review downloads the required revisions again. Downloads use temporary files outside the workspace, with size monitoring and cleanup after the provider exits. Review construction processes bounded chunks rather than downloading an entire large review at once.
+
+Hunk still requires the initial patches before displaying the review; its current VCS API cannot resolve those patches progressively. Hosts with extension API 25 or newer use asynchronous, cancellable watch signatures. Older hosts retain the synchronous watch hook they support.
+
 ## Usage
 
 Hunk selects Plastic automatically when it finds `.plastic`. The adapter has a higher same-root detection priority than Git because Plastic workspaces often contain a `.git` directory for other tools.

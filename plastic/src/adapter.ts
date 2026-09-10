@@ -1,4 +1,4 @@
-import { lstat, open, readdir, readlink } from "node:fs/promises";
+import { lstat, readdir, readlink } from "node:fs/promises";
 import { lstatSync, readdirSync, readlinkSync } from "node:fs";
 import { basename, isAbsolute, relative, resolve, sep } from "node:path";
 import {
@@ -8,6 +8,7 @@ import {
   type ExtensionVcsDiffInput,
   type ExtensionVcsExtraFile,
   type ExtensionVcsFileChangeType,
+  type ExtensionVcsFileStats,
   type ExtensionVcsShowInput,
   type ExtensionVcsSkippedFile,
 } from "hunkdiff/extension";
@@ -19,7 +20,6 @@ import {
 import {
   findPlasticRepoRoot,
   PLASTIC_DIFF_FORMAT,
-  pathMatchesPlasticPathspecs,
   readPlasticDiffInventory,
   readPlasticWorkspaceHeader,
   readPlasticWorkspaceStatus,
@@ -38,6 +38,10 @@ import {
   createPlasticCommandRunner,
   type PlasticCommandRunner,
 } from "./process";
+import { forEachOrdered, together } from "./concurrency";
+import { PlasticDiskCache } from "./cache";
+import { PlasticFileTooLargeError, readPlasticFile } from "./files";
+import { PlasticReadSession, type PlasticRevisionRead } from "./read-session";
 
 type PlasticInput = ExtensionVcsDiffInput | ExtensionVcsShowInput;
 type PlasticReviewFile = (PlasticBuiltFile | ExtensionVcsSkippedFile) & {
@@ -56,16 +60,13 @@ export const PLASTIC_DIFF_FILE_MAX_LINES = 20_000;
  */
 export const PLASTIC_REVIEW_MAX_SOURCE_BYTES = 32_000_000;
 
-class PlasticFileTooLargeError extends Error {
-  constructor(readonly maxBytes: number) {
-    super(`Plastic file exceeds ${maxBytes} bytes.`);
-    this.name = "PlasticFileTooLargeError";
-  }
-}
-
 export interface PlasticVcsAdapterOptions {
   cmExecutable?: string;
   runner?: PlasticCommandRunner;
+  /** Disable persistent caching with false, or override its directory. */
+  cacheDirectory?: string | false;
+  /** Enables newer host capabilities while keeping API 14 hosts supported. */
+  apiVersion?: number;
 }
 
 function firstErrorLine(error: PlasticCommandFailure) {
@@ -207,6 +208,7 @@ function skippedFile(
   path: string,
   previousPath: string | undefined,
   changeType: ExtensionVcsFileChangeType,
+  stats?: ExtensionVcsFileStats,
 ): ExtensionVcsSkippedFile {
   return {
     kind: "skipped",
@@ -214,6 +216,7 @@ function skippedFile(
     ...(previousPath ? { previousPath } : {}),
     reason: "too-large",
     changeType,
+    ...(stats ? { stats } : { statsTruncated: true }),
   };
 }
 
@@ -295,27 +298,23 @@ async function buildWorkspaceFile(
     );
   }
   try {
-    const oldContent =
+    const [newContent, oldContent] = await together([
+      kind === "deleted"
+        ? Promise.resolve(null)
+        : readWorkspaceContent(repoRoot, change.path, signal),
       kind === "new"
-        ? null
-        : await readWorkspaceBase(
+        ? Promise.resolve(null)
+        : readWorkspaceBase(
             runner,
             repoRoot,
             change.baseRevisionId ?? "",
             change.baseItemType ?? change.revisionType,
             status,
             signal,
-          );
-    const newContent =
-      kind === "deleted"
-        ? null
-        : await readWorkspaceContent(repoRoot, change.path, signal);
+          ),
+    ]);
     if (fileExceedsLineLimit(oldContent) || fileExceedsLineLimit(newContent)) {
-      return skippedFile(
-        change.path,
-        previousPath,
-        workspaceChangeType(kind),
-      );
+      return skippedFile(change.path, previousPath, workspaceChangeType(kind));
     }
     return buildPlasticFilePatch({
       path: change.path,
@@ -328,11 +327,7 @@ async function buildWorkspaceFile(
     });
   } catch (error) {
     if (error instanceof PlasticFileTooLargeError) {
-      return skippedFile(
-        change.path,
-        previousPath,
-        workspaceChangeType(kind),
-      );
+      return skippedFile(change.path, previousPath, workspaceChangeType(kind));
     }
     throw error;
   }
@@ -347,49 +342,16 @@ function fileExceedsLineLimit(content: Buffer | null) {
   return content.at(-1) !== 0x0a && ++lines > PLASTIC_DIFF_FILE_MAX_LINES;
 }
 
-async function readFileWithLimit(
-  path: string,
-  signal: AbortSignal | undefined,
-  maxBytes: number,
-) {
-  const handle = await open(path, "r");
-  const chunks: Buffer[] = [];
-  let bytes = 0;
-  try {
-    for (;;) {
-      signal?.throwIfAborted();
-      const chunk = Buffer.allocUnsafe(
-        Math.min(64 * 1024, maxBytes + 1 - bytes),
-      );
-      const { bytesRead } = await handle.read(chunk, 0, chunk.byteLength, null);
-      if (bytesRead === 0) return Buffer.concat(chunks, bytes);
-      bytes += bytesRead;
-      if (bytes > maxBytes) throw new PlasticFileTooLargeError(maxBytes);
-      chunks.push(chunk.subarray(0, bytesRead));
-    }
-  } finally {
-    await handle.close();
-  }
-}
-
 async function readWorkspaceContent(
   repoRoot: string,
   path: string,
   signal?: AbortSignal,
 ) {
-  const absolute = localPath(repoRoot, path);
-  const stat = await lstat(absolute);
-  if (stat.isSymbolicLink()) {
-    const content = Buffer.from(await readlink(absolute));
-    if (content.byteLength > PLASTIC_DIFF_FILE_MAX_BYTES) {
-      throw new PlasticFileTooLargeError(PLASTIC_DIFF_FILE_MAX_BYTES);
-    }
-    return content;
-  }
-  if (stat.size > PLASTIC_DIFF_FILE_MAX_BYTES) {
-    throw new PlasticFileTooLargeError(PLASTIC_DIFF_FILE_MAX_BYTES);
-  }
-  return readFileWithLimit(absolute, signal, PLASTIC_DIFF_FILE_MAX_BYTES);
+  return readPlasticFile(
+    localPath(repoRoot, path),
+    PLASTIC_DIFF_FILE_MAX_BYTES,
+    signal,
+  );
 }
 
 function pathIsWithin(path: string, directory: string) {
@@ -400,14 +362,57 @@ function movePath(path: string, from: string, to: string) {
   return `${to}${path.slice(from.length)}`;
 }
 
-async function listLocalFiles(repoRoot: string, directory: string) {
+type PathSelection = (
+  path: string,
+  previousPath: string | undefined,
+  directory: boolean,
+) => boolean;
+
+function selectPaths(
+  input: PlasticInput,
+  cwd: string,
+  repoRoot: string,
+): PathSelection {
+  if (!input.pathspecs?.length) return () => true;
+  const scopes = input.pathspecs.map((path) =>
+    normalizeScope(path, cwd, repoRoot),
+  );
+  return (path, previousPath, directory) =>
+    scopes.some(
+      (scope) =>
+        scope !== null &&
+        (scope === "" ||
+          pathIsWithin(path, scope) ||
+          (previousPath !== undefined && pathIsWithin(previousPath, scope)) ||
+          (directory &&
+            (pathIsWithin(scope, path) ||
+              (previousPath !== undefined &&
+                pathIsWithin(scope, previousPath))))),
+    );
+}
+
+function normalizeScope(path: string, cwd: string, repoRoot: string) {
+  const fromRoot = relative(repoRoot, resolve(cwd, path)).replaceAll("\\", "/");
+  return fromRoot === ".." || fromRoot.startsWith("../") || isAbsolute(fromRoot)
+    ? null
+    : fromRoot;
+}
+
+async function listLocalFiles(
+  repoRoot: string,
+  directory: string,
+  select: PathSelection,
+  signal?: AbortSignal,
+) {
   const files: string[] = [];
   const visit = async (repoPath: string): Promise<void> => {
     const entries = await readdir(localPath(repoRoot, repoPath), {
       withFileTypes: true,
     });
     for (const entry of entries) {
+      signal?.throwIfAborted();
       const child = repoPath ? `${repoPath}/${entry.name}` : entry.name;
+      if (!select(child, undefined, entry.isDirectory())) continue;
       if (entry.isDirectory()) await visit(child);
       else files.push(child);
     }
@@ -430,9 +435,17 @@ async function expandWorkspaceChanges(
   runner: PlasticCommandRunner,
   repoRoot: string,
   status: PlasticWorkspaceStatus,
+  select: PathSelection,
+  excludeUntracked: boolean,
   signal?: AbortSignal,
 ) {
-  const basePaths = status.changes.flatMap((change) => {
+  const changes = status.changes.filter(
+    (change) =>
+      !(
+        excludeUntracked && classifyPlasticWorkspaceCode(change) === "private"
+      ) && select(change.path, change.oldPath, isDirectory(change)),
+  );
+  const basePaths = changes.flatMap((change) => {
     const kind = classifyPlasticWorkspaceCode(change);
     if (kind === "new" || kind === "private" || kind === "skip") return [];
     if (kind === "moved" && !change.oldPath) {
@@ -442,17 +455,63 @@ async function expandWorkspaceChanges(
     }
     return [kind === "moved" ? change.oldPath! : change.path];
   });
-  const baseEntries = await readPlasticTreeEntries(
+  const baseEntriesPromise = readPlasticTreeEntries(
     runner,
     repoRoot,
     `cs:${status.changeset}`,
     [...new Set(basePaths)],
     signal,
   );
+  // Status --all already reports many directory descendants. Only query the
+  // remaining files, across all new/private directories in one fileinfo batch.
+  const reportedFiles = new Set(
+    status.changes
+      .filter((change) => !isDirectory(change))
+      .map((change) => change.path),
+  );
+  const localInfoPromise = (async () => {
+    const owners = new Map<string, PlasticWorkspaceChange>();
+    for (const change of changes) {
+      const kind = classifyPlasticWorkspaceCode(change);
+      if (!isDirectory(change) || (kind !== "private" && kind !== "new"))
+        continue;
+      for (const path of await listLocalFiles(
+        repoRoot,
+        change.path,
+        select,
+        signal,
+      )) {
+        if (!reportedFiles.has(path)) owners.set(path, change);
+      }
+    }
+    const info = await readPlasticWorkspaceFileInfo(
+      runner,
+      repoRoot,
+      [...owners.keys()].map((path) => localPath(repoRoot, path)),
+      signal,
+    );
+    return info.flatMap((entry) => {
+      const owner = owners.get(entry.path);
+      if (!owner) return [];
+      const kind = classifyPlasticWorkspaceCode(owner);
+      if (
+        !(kind === "private"
+          ? entry.status === "private"
+          : entry.status === "added" || entry.status === "copied")
+      )
+        return [];
+      const { oldPath: _oldPath, ...change } = owner;
+      return [{ ...change, path: entry.path, revisionType: entry.itemType }];
+    });
+  })();
+  const [baseEntries, localChanges] = await Promise.all([
+    baseEntriesPromise,
+    localInfoPromise,
+  ]);
   const baseByPath = new Map(
     baseEntries.map((entry) => [entry.path, entry] as const),
   );
-  const synthesized: PlasticWorkspaceChange[] = [];
+  const synthesized: PlasticWorkspaceChange[] = localChanges;
   const direct: PlasticWorkspaceChange[] = [];
   const directlyMovedOldPaths = new Set(
     status.changes.flatMap((change) =>
@@ -464,7 +523,7 @@ async function expandWorkspaceChanges(
     ),
   );
 
-  for (const change of status.changes) {
+  for (const change of changes) {
     const kind = classifyPlasticWorkspaceCode(change);
     if (!isDirectory(change)) {
       const oldPath = kind === "moved" ? change.oldPath : change.path;
@@ -482,26 +541,6 @@ async function expandWorkspaceChanges(
     }
     if (kind === "skip") continue;
     if (kind === "private" || kind === "new") {
-      const { oldPath: _oldPath, ...directoryChange } = change;
-      const localFiles = await listLocalFiles(repoRoot, change.path);
-      const fileInfo = await readPlasticWorkspaceFileInfo(
-        runner,
-        repoRoot,
-        localFiles.map((path) => localPath(repoRoot, path)),
-        signal,
-      );
-      for (const info of fileInfo) {
-        const matchesKind =
-          kind === "private"
-            ? info.status === "private"
-            : info.status === "added" || info.status === "copied";
-        if (!matchesKind || !pathIsWithin(info.path, change.path)) continue;
-        synthesized.push({
-          ...directoryChange,
-          path: info.path,
-          revisionType: info.itemType,
-        });
-      }
       continue;
     }
     const oldDirectory = kind === "moved" ? change.oldPath : change.path;
@@ -661,16 +700,25 @@ async function expandRevisionChanges(
   repoRoot: string,
   specs: readonly string[],
   changes: readonly PlasticRevisionChange[],
+  select: PathSelection,
   signal?: AbortSignal,
 ) {
-  const directories = changes.filter((change) =>
-    isDirectoryType(change.itemType),
+  const directories = changes.filter((change) => {
+    const paths = revisionPaths(change);
+    return (
+      isDirectoryType(change.itemType) &&
+      select(paths.path, paths.previousPath, true)
+    );
+  });
+  const allFiles = coalesceRevisionChanges(
+    changes.filter((change) => !isDirectoryType(change.itemType)),
   );
-  const files = changes.filter((change) => !isDirectoryType(change.itemType));
-  if (!directories.length) return coalesceRevisionChanges(files);
-  const directMoves = coalesceRevisionChanges(files).filter(
-    (change) => change.status === "M",
-  );
+  const files = allFiles.filter((change) => {
+    const paths = revisionPaths(change);
+    return select(paths.path, paths.previousPath, false);
+  });
+  if (!directories.length) return files;
+  const directMoves = allFiles.filter((change) => change.status === "M");
   const directlyMovedOldPaths = new Set(
     directMoves.map((change) => revisionPaths(change).previousPath!),
   );
@@ -783,6 +831,39 @@ function revisionSpec(revisionId: string, status: PlasticWorkspaceStatus) {
   return `revid:${revisionId}@rep:${status.repository}@repserver:${status.server}`;
 }
 
+function revisionRead(
+  status: PlasticWorkspaceStatus,
+  revisionId: string,
+  itemType: string,
+): PlasticRevisionRead {
+  return {
+    spec: revisionSpec(revisionId, status),
+    symlink: isSymlinkType(itemType),
+  };
+}
+
+function revisionSides(change: PlasticRevisionChange) {
+  const oldRevision =
+    change.status === "D"
+      ? change.revisionId
+      : change.status === "M" && change.baseRevisionId === "-1"
+        ? change.parentRevisionId
+        : change.baseRevisionId;
+  return {
+    old:
+      change.status === "A" || oldRevision === "-1"
+        ? null
+        : {
+            revisionId: oldRevision,
+            itemType: change.oldItemType ?? change.itemType,
+          },
+    new:
+      change.status === "D" || change.revisionId === "-1"
+        ? null
+        : { revisionId: change.revisionId, itemType: change.itemType },
+  };
+}
+
 async function buildRevisionFile(
   runner: PlasticCommandRunner,
   repoRoot: string,
@@ -793,13 +874,7 @@ async function buildRevisionFile(
   const paths = revisionPaths(change);
   const previousPath =
     change.status === "M" ? (paths.previousPath ?? paths.path) : undefined;
-  const oldRevision =
-    change.status === "D"
-      ? change.revisionId
-      : change.status === "M" && change.baseRevisionId === "-1"
-        ? change.parentRevisionId
-        : change.baseRevisionId;
-  const newRevision = change.status === "D" ? "-1" : change.revisionId;
+  const sides = revisionSides(change);
   const oldItemType = change.oldItemType ?? change.itemType;
   const changeType: ExtensionVcsFileChangeType =
     change.status === "A"
@@ -810,28 +885,28 @@ async function buildRevisionFile(
           ? "rename-changed"
           : "change";
   try {
-    const oldContent =
-      change.status === "A" || oldRevision === "-1"
-        ? null
-        : await readRevisionContent(
+    const [oldContent, newContent] = await together([
+      sides.old === null
+        ? Promise.resolve(null)
+        : readRevisionContent(
             runner,
             repoRoot,
             workspace,
-            oldRevision,
+            sides.old.revisionId,
             oldItemType,
             signal,
-          );
-    const newContent =
-      change.status === "D" || newRevision === "-1"
-        ? null
-        : await readRevisionContent(
+          ),
+      sides.new === null
+        ? Promise.resolve(null)
+        : readRevisionContent(
             runner,
             repoRoot,
             workspace,
-            newRevision,
+            sides.new.revisionId,
             change.itemType,
             signal,
-          );
+          ),
+    ]);
     if (fileExceedsLineLimit(oldContent) || fileExceedsLineLimit(newContent)) {
       return skippedFile(paths.path, previousPath, changeType);
     }
@@ -875,6 +950,20 @@ async function readRevisionContent(
     if (content.byteLength > PLASTIC_DIFF_FILE_MAX_BYTES) {
       throw new PlasticFileTooLargeError(PLASTIC_DIFF_FILE_MAX_BYTES);
     }
+    // Plastic's file-output mode stores symlink targets as BOM-marked UTF-16.
+    // Compare the decoded target with readlink(), not that serialized payload.
+    if (isSymlinkType(itemType) && content.length >= 2) {
+      const encoding =
+        content[0] === 0xff && content[1] === 0xfe
+          ? "utf-16le"
+          : content[0] === 0xfe && content[1] === 0xff
+            ? "utf-16be"
+            : undefined;
+      if (encoding)
+        return Buffer.from(
+          new TextDecoder(encoding, { fatal: true }).decode(content),
+        );
+    }
     return content;
   } catch (error) {
     if (error instanceof PlasticCommandOutputTooLarge) {
@@ -895,35 +984,39 @@ function isBuiltFile(file: PlasticReviewFile): file is PlasticBuiltFile {
 async function mapFiles<T>(
   values: readonly T[],
   callback: (value: T) => Promise<PlasticReviewFile | null>,
+  prepare: (values: readonly T[]) => Promise<void>,
 ) {
-  // Four clients keep multi-file reviews responsive without launching one `cm cat`
-  // process per changed file. Fixed-size batches make the retained-byte choice
-  // deterministic in review order while bounding in-flight source data too.
+  // Prefetch 64 files at a time: at most 128 one-megabyte revision downloads
+  // for a two-sided review. Build four patches at a time to bound live buffers
+  // and account for the review-wide source budget in deterministic order.
   const results = new Array<PlasticReviewFile | null>(values.length);
   let retainedSourceBytes = 0;
-  for (let start = 0; start < values.length; start += 4) {
-    const batch = await Promise.all(
-      values.slice(start, start + 4).map(callback),
-    );
-    for (const [offset, file] of batch.entries()) {
+  for (let start = 0; start < values.length; start += 64) {
+    const chunk = values.slice(start, start + 64);
+    await prepare(chunk);
+    await forEachOrdered(chunk, 4, callback, (file, offset) => {
       const index = start + offset;
       if (
         file !== null &&
         isBuiltFile(file) &&
-        retainedSourceBytes + file.sourceBytes >
-          PLASTIC_REVIEW_MAX_SOURCE_BYTES
+        retainedSourceBytes + file.sourceBytes > PLASTIC_REVIEW_MAX_SOURCE_BYTES
       ) {
         results[index] = {
-          ...skippedFile(file.path, file.previousPath, file.changeType),
+          ...skippedFile(
+            file.path,
+            file.previousPath,
+            file.changeType,
+            file.stats,
+          ),
           ...(file.isUntracked ? { isUntracked: true } : {}),
         };
-        continue;
+        return;
       }
       if (file !== null && isBuiltFile(file)) {
         retainedSourceBytes += file.sourceBytes;
       }
       results[index] = file;
-    }
+    });
   }
   return results;
 }
@@ -1004,12 +1097,22 @@ function stableWorkspaceSignature(
   status: PlasticWorkspaceStatus,
   repoRoot: string,
 ) {
+  return workspaceSignature(
+    status,
+    status.changes.map(({ path }) => workspacePathSignature(repoRoot, path)),
+  );
+}
+
+function workspaceSignature(
+  status: PlasticWorkspaceStatus,
+  worktrees: unknown[],
+) {
   return JSON.stringify({
     changeset: status.changeset,
     repository: status.repository,
     server: status.server,
     changes: status.changes.map(
-      ({ code, path, oldPath, revisionType, size, lastModified }) => {
+      ({ code, path, oldPath, revisionType, size, lastModified }, index) => {
         return {
           code,
           path,
@@ -1017,11 +1120,60 @@ function stableWorkspaceSignature(
           revisionType,
           size,
           lastModified,
-          worktree: workspacePathSignature(repoRoot, path),
+          worktree: worktrees[index],
         };
       },
     ),
   });
+}
+
+async function asyncWorkspaceSignature(
+  status: PlasticWorkspaceStatus,
+  repoRoot: string,
+  signal?: AbortSignal,
+) {
+  const worktrees: unknown[] = [];
+  for (let start = 0; start < status.changes.length; start += 16) {
+    worktrees.push(
+      ...(await Promise.all(
+        status.changes.slice(start, start + 16).map(async (change) => {
+          const entries: unknown[] = [];
+          const visit = async (path: string): Promise<void> => {
+            signal?.throwIfAborted();
+            const absolute = localPath(repoRoot, path);
+            const info = await lstat(absolute);
+            const type = info.isSymbolicLink()
+              ? "symlink"
+              : info.isDirectory()
+                ? "directory"
+                : "file";
+            entries.push({
+              path,
+              type,
+              size: info.size,
+              mtimeMs: info.mtimeMs,
+              ctimeMs: info.ctimeMs,
+              ...(type === "symlink"
+                ? { target: await readlink(absolute) }
+                : {}),
+            });
+            if (type === "directory")
+              for (const name of (await readdir(absolute)).sort())
+                await visit(`${path}/${name}`);
+          };
+          try {
+            await visit(change.path);
+            return entries;
+          } catch {
+            signal?.throwIfAborted();
+            return null;
+          }
+        }),
+      )),
+    );
+  }
+  signal?.throwIfAborted();
+  return workspaceSignature(status, worktrees);
 }
 
 function inputSpecs(input: ExtensionVcsDiffInput) {
@@ -1034,20 +1186,126 @@ function inputSpecs(input: ExtensionVcsDiffInput) {
   return input.range ? [requireRevision(input.range)] : [];
 }
 
+async function loadRevisionFiles(
+  reader: PlasticReadSession,
+  repoRoot: string,
+  workspace: PlasticWorkspaceStatus,
+  specs: readonly string[],
+  select: PathSelection,
+  signal?: AbortSignal,
+  initialInventory?: PlasticRevisionChange[],
+) {
+  const inventory = (
+    await expandRevisionChanges(
+      reader,
+      repoRoot,
+      specs,
+      initialInventory ??
+        (await readPlasticDiffInventory(reader, repoRoot, specs, signal)),
+      select,
+      signal,
+    )
+  ).filter((change) => {
+    const paths = revisionPaths(change);
+    return select(paths.path, paths.previousPath, false);
+  });
+  return (
+    await mapFiles(
+      inventory,
+      (change) =>
+        buildRevisionFile(reader, repoRoot, workspace, change, signal),
+      (batch) =>
+        reader.prefetch(
+          batch.flatMap((change) =>
+            Object.values(revisionSides(change)).flatMap((side) =>
+              side
+                ? [revisionRead(workspace, side.revisionId, side.itemType)]
+                : [],
+            ),
+          ),
+        ),
+    )
+  ).filter((file): file is PlasticReviewFile => file !== null);
+}
+
+async function loadWorkspaceFiles(
+  reader: PlasticReadSession,
+  repoRoot: string,
+  status: PlasticWorkspaceStatus,
+  input: ExtensionVcsDiffInput,
+  select: PathSelection,
+  signal?: AbortSignal,
+) {
+  const changes = await expandWorkspaceChanges(
+    reader,
+    repoRoot,
+    status,
+    select,
+    input.options.excludeUntracked === true,
+    signal,
+  );
+  const reviewChanges = changes.flatMap((change) => {
+    const kind = classifyPlasticWorkspaceChange(change);
+    return kind === "skip" ||
+      (kind === "private" && input.options.excludeUntracked) ||
+      !select(change.path, change.oldPath, false)
+      ? []
+      : [{ change, kind }];
+  });
+  return (
+    await mapFiles(
+      reviewChanges,
+      async ({ change, kind }) => {
+        const file = await buildWorkspaceFile(
+          reader,
+          repoRoot,
+          status,
+          change,
+          kind === "private" ? "new" : kind,
+          signal,
+        );
+        return file && kind === "private"
+          ? { ...file, isUntracked: true }
+          : file;
+      },
+      (batch) =>
+        reader.prefetch(
+          batch.flatMap(({ change, kind }) => {
+            if (
+              kind === "new" ||
+              kind === "private" ||
+              (kind !== "deleted" &&
+                Number(change.size) > PLASTIC_DIFF_FILE_MAX_BYTES)
+            )
+              return [];
+            return [
+              revisionRead(
+                status,
+                change.baseRevisionId ?? "",
+                change.baseItemType ?? change.revisionType,
+              ),
+            ];
+          }),
+        ),
+    )
+  ).filter((file): file is PlasticReviewFile => file !== null);
+}
+
 export function createPlasticVcsAdapter({
   cmExecutable = "cm",
   runner = createPlasticCommandRunner(cmExecutable),
+  cacheDirectory,
+  apiVersion = 14,
 }: Readonly<PlasticVcsAdapterOptions> = {}) {
-  return {
+  const cache = new PlasticDiskCache(cacheDirectory);
+  const adapter = {
     id: "plastic",
     name: "Plastic SCM",
-    detect(cwd) {
+    detect(cwd: string) {
       const repoRoot = findPlasticRepoRoot(cwd);
       return repoRoot ? { id: "plastic", repoRoot } : null;
     },
-    // A Plastic workspace can contain `.git` for editor and agent tooling. Plastic
-    // is authoritative when both markers name the same root, so it must rank above jj (200).
-    detectionPriority: HUNK_VCS_DETECTION_BASELINE_PRIORITY + 300,
+    detectionPriority: HUNK_VCS_DETECTION_BASELINE_PRIORITY + 10,
     operations: {
       "working-tree-diff": {
         async load(input, context) {
@@ -1062,106 +1320,56 @@ export function createPlasticVcsAdapter({
             }
             const repoRoot = requireRepoRoot(cwd);
             const specs = inputSpecs(input);
-            if (specs.length) {
-              const workspace = await readPlasticWorkspaceHeader(
-                runner,
-                repoRoot,
-                signal,
-              );
-              const inventory = (
-                await expandRevisionChanges(
-                  runner,
-                  repoRoot,
-                  specs,
-                  await readPlasticDiffInventory(
-                    runner,
-                    repoRoot,
-                    specs,
-                    signal,
-                  ),
-                  signal,
-                )
-              ).filter((change) => {
-                const paths = revisionPaths(change);
-                return pathMatchesPlasticPathspecs(
-                  paths.path,
-                  paths.previousPath,
-                  input.pathspecs,
-                  cwd,
-                  repoRoot,
-                );
-              });
-              const built = (
-                await mapFiles(inventory, (change) =>
-                  buildRevisionFile(
-                    runner,
+            const [workspace, inventory] = specs.length
+              ? await together([
+                  readPlasticWorkspaceHeader(runner, repoRoot, signal),
+                  readPlasticDiffInventory(runner, repoRoot, specs, signal),
+                ])
+              : ([
+                  await readPlasticWorkspaceStatus(runner, repoRoot, signal),
+                  undefined,
+                ] as const);
+            const reader = new PlasticReadSession(
+              runner,
+              cache,
+              workspace,
+              repoRoot,
+              PLASTIC_DIFF_FILE_MAX_BYTES,
+              signal,
+            );
+            try {
+              const select = selectPaths(input, cwd, repoRoot);
+              const built = specs.length
+                ? await loadRevisionFiles(
+                    reader,
                     repoRoot,
                     workspace,
-                    change,
+                    specs,
+                    select,
                     signal,
-                  ),
-                )
-              ).filter((file): file is PlasticReviewFile => file !== null);
+                    inventory,
+                  )
+                : await loadWorkspaceFiles(
+                    reader,
+                    repoRoot,
+                    workspace,
+                    input,
+                    select,
+                    signal,
+                  );
               return {
                 repoRoot,
                 sourceLabel: repoRoot,
-                title: `${basename(repoRoot)} ${specs.join(" to ")}`,
+                title: specs.length
+                  ? `${basename(repoRoot)} ${specs.join(" to ")}`
+                  : `${basename(repoRoot)} working copy`,
                 patchText: "",
                 extraFiles: toExtraFiles(built),
                 ...sourceCapability(built),
               };
+            } finally {
+              await reader.close();
             }
-
-            const status = await readPlasticWorkspaceStatus(
-              runner,
-              repoRoot,
-              signal,
-            );
-            const changes = await expandWorkspaceChanges(
-              runner,
-              repoRoot,
-              status,
-              signal,
-            );
-            const selected = changes.filter((change) =>
-              pathMatchesPlasticPathspecs(
-                change.path,
-                change.oldPath,
-                input.pathspecs,
-                cwd,
-                repoRoot,
-              ),
-            );
-            const reviewChanges = selected.flatMap((change) => {
-              const kind = classifyPlasticWorkspaceChange(change);
-              return kind === "skip" ||
-                (kind === "private" && input.options.excludeUntracked)
-                ? []
-                : [{ change, kind }];
-            });
-            const built = (
-              await mapFiles(reviewChanges, async ({ change, kind }) => {
-                const file = await buildWorkspaceFile(
-                  runner,
-                  repoRoot,
-                  status,
-                  change,
-                  kind === "private" ? "new" : kind,
-                  signal,
-                );
-                return file && kind === "private"
-                  ? { ...file, isUntracked: true }
-                  : file;
-              })
-            ).filter((file): file is PlasticReviewFile => file !== null);
-            return {
-              repoRoot,
-              sourceLabel: repoRoot,
-              title: `${basename(repoRoot)} working copy`,
-              patchText: "",
-              extraFiles: toExtraFiles(built),
-              ...sourceCapability(built),
-            };
           } catch (error) {
             if (signal?.aborted) signal.throwIfAborted();
             throw translatePlasticError(input, error);
@@ -1199,45 +1407,50 @@ export function createPlasticVcsAdapter({
           const signal = contextSignal(context);
           try {
             const repoRoot = requireRepoRoot(cwd);
-            const workspace = await readPlasticWorkspaceHeader(
+            const explicitRef =
+              input.ref === undefined ? undefined : requireRevision(input.ref);
+            const [workspace, inventory] = await together([
+              readPlasticWorkspaceHeader(runner, repoRoot, signal),
+              explicitRef === undefined
+                ? Promise.resolve(undefined)
+                : readPlasticDiffInventory(
+                    runner,
+                    repoRoot,
+                    [explicitRef],
+                    signal,
+                  ),
+            ]);
+            const ref =
+              explicitRef ?? requireRevision(`cs:${workspace.changeset}`);
+            const reader = new PlasticReadSession(
               runner,
+              cache,
+              workspace,
               repoRoot,
+              PLASTIC_DIFF_FILE_MAX_BYTES,
               signal,
             );
-            const ref = requireRevision(
-              input.ref ?? `cs:${workspace.changeset}`,
-            );
-            const inventory = (
-              await expandRevisionChanges(
-                runner,
+            try {
+              const built = await loadRevisionFiles(
+                reader,
                 repoRoot,
+                workspace,
                 [ref],
-                await readPlasticDiffInventory(runner, repoRoot, [ref], signal),
+                selectPaths(input, cwd, repoRoot),
                 signal,
-              )
-            ).filter((change) => {
-              const paths = revisionPaths(change);
-              return pathMatchesPlasticPathspecs(
-                paths.path,
-                paths.previousPath,
-                input.pathspecs,
-                cwd,
-                repoRoot,
+                inventory,
               );
-            });
-            const built = (
-              await mapFiles(inventory, (change) =>
-                buildRevisionFile(runner, repoRoot, workspace, change, signal),
-              )
-            ).filter((file): file is PlasticReviewFile => file !== null);
-            return {
-              repoRoot,
-              sourceLabel: repoRoot,
-              title: `${basename(repoRoot)} show ${ref}`,
-              patchText: "",
-              extraFiles: toExtraFiles(built),
-              ...sourceCapability(built),
-            };
+              return {
+                repoRoot,
+                sourceLabel: repoRoot,
+                title: `${basename(repoRoot)} show ${ref}`,
+                patchText: "",
+                extraFiles: toExtraFiles(built),
+                ...sourceCapability(built),
+              };
+            } finally {
+              await reader.close();
+            }
           } catch (error) {
             if (signal?.aborted) signal.throwIfAborted();
             throw translatePlasticError(input, error);
@@ -1246,6 +1459,49 @@ export function createPlasticVcsAdapter({
       },
     },
   } satisfies ExtensionVcsAdapter;
+  // API 25 adds Promise-returning signatures. The minimum supported host and
+  // published npm types are still API 14; never install this hook on them.
+  if (apiVersion >= 25) {
+    Object.assign(adapter.operations["working-tree-diff"], {
+      async watchSignature(
+        input: ExtensionVcsDiffInput,
+        context: { cwd: string; signal?: AbortSignal },
+      ) {
+        try {
+          const repoRoot = requireRepoRoot(context.cwd);
+          if (input.range || input.rangeEndpoints) {
+            return (
+              await runner.run(
+                [
+                  "diff",
+                  ...inputSpecs(input),
+                  "--repositorypaths",
+                  `--format=${PLASTIC_DIFF_FORMAT}`,
+                  "--encoding=utf-8",
+                ],
+                repoRoot,
+                context.signal,
+              )
+            ).toString("utf8");
+          }
+          const status = await readPlasticWorkspaceStatus(
+            runner,
+            repoRoot,
+            context.signal,
+          );
+          return await asyncWorkspaceSignature(
+            status,
+            repoRoot,
+            context.signal,
+          );
+        } catch (error) {
+          context.signal?.throwIfAborted();
+          throw translatePlasticError(input, error);
+        }
+      },
+    });
+  }
+  return adapter;
 }
 
 export const PlasticVcsAdapter = createPlasticVcsAdapter();

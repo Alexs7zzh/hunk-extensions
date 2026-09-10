@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import type {
   ExtensionVcsFileChangeType,
   ExtensionVcsFileSourceReader,
+  ExtensionVcsFileStats,
 } from "hunkdiff/extension";
 import { createUnifiedFilePatch } from "./unified";
 
@@ -20,6 +21,7 @@ export interface PlasticBuiltFile {
   previousPath?: string;
   patchText: string;
   changeType: ExtensionVcsFileChangeType;
+  stats: ExtensionVcsFileStats;
   oldText: string | null;
   newText: string | null;
   /** Raw bytes consumed while building this patch, used by the review-wide budget. */
@@ -78,6 +80,7 @@ export function buildPlasticFilePatch(
           : "rename-changed"
         : "change";
   const lines = [gitHeader(version.path, previousPath)];
+  const stats = { additions: 0, deletions: 0 };
 
   if (oldMissing) lines.push(`new file mode ${newMode}`);
   if (newMissing) lines.push(`deleted file mode ${oldMode}`);
@@ -99,15 +102,20 @@ export function buildPlasticFilePatch(
       `Binary files ${quoteGitPath(oldLabel)} and ${quoteGitPath(newLabel)} differ`,
     );
   } else if (!contentEqual || oldMissing || newMissing) {
-    lines.push(
-      createUnifiedFilePatch(
-        quoteGitPath(oldLabel),
-        quoteGitPath(newLabel),
-        oldText ?? "",
-        newText ?? "",
-        3,
-      ).slice(0, -1),
-    );
+    const patch = createUnifiedFilePatch(
+      quoteGitPath(oldLabel),
+      quoteGitPath(newLabel),
+      oldText ?? "",
+      newText ?? "",
+      3,
+    ).slice(0, -1);
+    let inHunk = false;
+    for (const line of patch.split("\n")) {
+      if (line.startsWith("@@")) inHunk = true;
+      else if (inHunk && line.startsWith("+")) stats.additions++;
+      else if (inHunk && line.startsWith("-")) stats.deletions++;
+    }
+    lines.push(patch);
   }
 
   return {
@@ -115,10 +123,10 @@ export function buildPlasticFilePatch(
     ...(previousPath ? { previousPath } : {}),
     patchText: `${lines.join("\n")}\n`,
     changeType,
+    stats,
     oldText,
     newText,
-    sourceBytes:
-      (oldContent?.byteLength ?? 0) + (newContent?.byteLength ?? 0),
+    sourceBytes: (oldContent?.byteLength ?? 0) + (newContent?.byteLength ?? 0),
   };
 }
 
