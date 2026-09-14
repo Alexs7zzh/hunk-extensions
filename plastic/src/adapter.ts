@@ -250,6 +250,11 @@ function classifyPlasticWorkspaceCode(
   );
 }
 
+function reportsWorkspaceChange(change: PlasticWorkspaceChange) {
+  const codes = new Set(change.code.split("+"));
+  return codes.has("CH") || codes.has("HD") || codes.has("RP");
+}
+
 function localPath(repoRoot: string, repoPath: string) {
   const absolute = resolve(repoRoot, repoPath);
   const fromRoot = relative(repoRoot, absolute);
@@ -321,6 +326,8 @@ async function buildWorkspaceFile(
       ...(previousPath ? { previousPath } : {}),
       oldContent,
       newContent,
+      preserveEmptyChange:
+        kind === "change" && reportsWorkspaceChange(change),
       declaredBinary: isBinaryType(change.revisionType),
       oldMode: modeForItemType(change.baseItemType ?? change.revisionType),
       newMode: modeForItemType(change.revisionType),

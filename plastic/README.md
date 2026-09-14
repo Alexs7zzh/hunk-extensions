@@ -27,6 +27,8 @@ Files larger than 1 MB or 20,000 lines stay visible in the file list but are not
 
 Added, modified, deleted, and renamed files keep their change types in Hunk. Private files carry the untracked label as well as the added-file patch. Binary markers, previous paths, symlink modes, and exact source contents are preserved. Skipped files retain their change type and any known line counts; unknown counts are marked as incomplete.
 
+Plastic can report a local file as changed even when its bytes match the loaded revision, for example after a tool rewrites identical content. Hunk keeps that file visible as a zero-line modification. Files that Plastic explicitly reports as checked out but unchanged remain hidden.
+
 ## Loading and caching
 
 The adapter batches revision downloads and filters paths before querying base inventories. Private-directory expansion reuses entries already returned by status and batches queries for any remaining descendants. Downloads preserve binary bytes and text byte-order marks instead of using Plastic's text-converting stdout output.

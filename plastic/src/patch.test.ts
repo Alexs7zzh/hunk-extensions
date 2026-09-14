@@ -174,6 +174,20 @@ describe("Plastic file patches", () => {
     ).toBeNull();
   });
 
+  test("keeps a provider-reported change visible when its bytes are equal", () => {
+    const file = buildPlasticFilePatch({
+      path: "status-only.txt",
+      oldContent: Buffer.from("same\n"),
+      newContent: Buffer.from("same\n"),
+      preserveEmptyChange: true,
+    });
+    expect(file?.patchText).toBe(
+      "diff --git a/status-only.txt b/status-only.txt\n",
+    );
+    expect(file?.stats).toEqual({ additions: 0, deletions: 0 });
+    expect(parseOne(file!.patchText).type).toBe("change");
+  });
+
   test("serves exact source sides and changes the cache identity with full content", async () => {
     const first = buildPlasticFilePatch({
       path: "src/main.ts",

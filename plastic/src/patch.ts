@@ -11,6 +11,8 @@ export interface PlasticFileVersion {
   previousPath?: string;
   oldContent: Buffer | null;
   newContent: Buffer | null;
+  /** Keep a provider-reported metadata change visible when bytes are equal. */
+  preserveEmptyChange?: boolean;
   declaredBinary?: boolean;
   oldMode?: string;
   newMode?: string;
@@ -59,7 +61,13 @@ export function buildPlasticFilePatch(
     oldContent !== null && newContent !== null && oldContent.equals(newContent);
   const oldMode = version.oldMode ?? "100644";
   const newMode = version.newMode ?? "100644";
-  if (!renamed && contentEqual && oldMode === newMode) return null;
+  if (
+    !renamed &&
+    contentEqual &&
+    oldMode === newMode &&
+    !version.preserveEmptyChange
+  )
+    return null;
 
   const oldMissing = oldContent === null;
   const newMissing = newContent === null;

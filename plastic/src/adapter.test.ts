@@ -662,18 +662,19 @@ describe("Plastic adapter", () => {
     expect(change("CO")).toBe("change");
   });
 
-  test("compares plain checkouts against the base even when Plastic calls replacements unchanged", async () => {
+  test("keeps reported changes but drops plain checkouts when bytes match the base", async () => {
     const root = await mkdtemp(join(tmpdir(), "hunk-plastic-checkout-"));
     const statusXml = `<StatusOutput><RepSpec><Server>cloud</Server><Name>repo</Name></RepSpec><Changeset>7</Changeset><Changes>
 <Change><Type>CO</Type><TypeVerbose>Replaced / Checked-out (unchanged)</TypeVerbose><Path>replaced.txt</Path><RevisionType>enTextFile</RevisionType></Change>
 <Change><Type>CO</Type><TypeVerbose>Checked-out (unchanged)</TypeVerbose><Path>unchanged.txt</Path><RevisionType>enTextFile</RevisionType></Change>
+<Change><Type>CH</Type><TypeVerbose>Changed</TypeVerbose><Path>status-only.txt</Path><RevisionType>enTextFile</RevisionType></Change>
 </Changes></StatusOutput>`;
     const runner: PlasticCommandRunner = {
       async run(args) {
         if (args[0] === "status") return Buffer.from(statusXml);
         if (args[0] === "ls")
           return Buffer.from(
-            "txt\u001freplaced.txt\u001f5\u001e\ntxt\u001funchanged.txt\u001f6\u001e\n",
+            "txt\u001freplaced.txt\u001f5\u001e\ntxt\u001funchanged.txt\u001f6\u001e\ntxt\u001fstatus-only.txt\u001f7\u001e\n",
           );
         if (args[0] === "cat") return Buffer.from("base content\n");
         throw new Error(`unexpected command ${args.join(" ")}`);
@@ -684,17 +685,24 @@ describe("Plastic adapter", () => {
       await mkdir(join(root, ".plastic"));
       await writeFile(join(root, "replaced.txt"), "replacement content\n");
       await writeFile(join(root, "unchanged.txt"), "base content\n");
+      await writeFile(join(root, "status-only.txt"), "base content\n");
       const result = await createPlasticVcsAdapter({ runner }).operations[
         "working-tree-diff"
       ]!.load({ kind: "vcs", staged: false, options: {} }, { cwd: root });
       expect(result.extraFiles?.map((file) => file.path)).toEqual([
         "replaced.txt",
+        "status-only.txt",
       ]);
       const file = result.extraFiles?.[0];
       expect(file?.kind).toBe("patch");
       if (file?.kind !== "patch") throw new Error("expected a patch");
       expect(file.patchText).toContain("-base content");
       expect(file.patchText).toContain("+replacement content");
+      expect(result.extraFiles?.[1]).toMatchObject({
+        kind: "patch",
+        path: "status-only.txt",
+        patchText: "diff --git a/status-only.txt b/status-only.txt\n",
+      });
     } finally {
       await rm(root, { recursive: true, force: true });
     }
